@@ -309,6 +309,8 @@ struct heap
     struct block   **pending_free;  /* Ring buffer for pending free requests */
     RTL_CRITICAL_SECTION cs;
     struct entry     free_lists[FREE_LIST_COUNT];
+    /* Bitmap tracking which free lists have blocks (1 = has blocks, 0 = empty) */
+    UINT64           free_list_bitmap[(FREE_LIST_COUNT + 63) / 64];
     struct bin      *bins;
     SUBHEAP          subheap;
 };
@@ -880,6 +882,7 @@ static void insert_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap,
 {
     struct entry *entry = (struct entry *)block, *list;
     struct block *next;
+    unsigned int index;
 
     if ((next = next_block( subheap, block )))
     {
@@ -892,6 +895,10 @@ static void insert_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap,
     list = find_free_list( heap, block_get_size( block ), !next );
     if (!next) list_add_before( &list->entry, &entry->entry );
     else list_add_after( &list->entry, &entry->entry );
+
+    /* Update bitmap to mark this free list as non-empty */
+    index = get_free_list_index( block_get_size( block ) );
+    heap->free_list_bitmap[index / 64] |= (UINT64)1 << (index % 64);
 }
 
 
@@ -1118,43 +1125,62 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 
 struct block *find_free_block(struct heap *heap, SIZE_T block_size)
 {
-    uint64_t start = rdtsc();
+    unsigned int index = get_free_list_index(block_size);
+    struct entry *list;
+    struct list *ptr;
 
-    struct list *ptr = heap->scan.ptr;
-
-    if (!ptr)
-        ptr = &find_free_list(heap, block_size, FALSE)->entry;
-
-    while (ptr)
+    /* O(1): Use bitmap to quickly find non-empty free lists */
+    while (index < FREE_LIST_COUNT)
     {
-        // TIME BUDGET CHECK (key idea)
-        if (rdtsc() - start > heap->budget_cycles)
+        /* Check bitmap first - O(1) check */
+        if (!(heap->free_list_bitmap[index / 64] & ((UINT64)1 << (index % 64))))
         {
-            heap->scan.ptr = ptr;
-            return NULL; // not done yet, try again later
-        }
-
-        struct entry *entry = LIST_ENTRY(ptr, struct entry, entry);
-        struct block *block = &entry->block;
-
-        ptr = list_next(&heap->free_lists[0].entry, ptr);
-
-        if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+            /* This free list is empty, skip to next one */
+            index++;
             continue;
-
-        if (block_get_size(block) >= block_size)
-        {
-            heap->scan.ptr = NULL; // reset scan state
-
-            if (!subheap_commit(heap,
-                                block_get_subheap(heap, block),
-                                block,
-                                block_size))
-                return NULL;
-
-            list_remove(&entry->entry);
-            return block;
         }
+
+        list = &heap->free_lists[index];
+
+        /* Check blocks in this free list */
+        ptr = list->entry.next;
+        while (ptr != &list->entry)
+        {
+            struct entry *entry = LIST_ENTRY(ptr, struct entry, entry);
+            struct block *block = &entry->block;
+
+            ptr = ptr->next;
+
+            /* Skip free link blocks (already being freed) */
+            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+                continue;
+
+            /* Check if this block is large enough */
+            if (block_get_size(block) >= block_size)
+            {
+                heap->scan.ptr = NULL; /* reset scan state */
+
+                if (!subheap_commit(heap,
+                                    block_get_subheap(heap, block),
+                                    block,
+                                    block_size))
+                    return NULL;
+
+                list_remove(&entry->entry);
+
+                /* Check if this free list is now empty and update bitmap */
+                if (list->entry.next == &list->entry)
+                {
+                    heap->free_list_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
+                }
+
+                return block;
+            }
+        }
+
+        /* This list had blocks but none fit - clear bitmap bit and continue */
+        heap->free_list_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
+        index++;
     }
 
     heap->scan.ptr = NULL;
@@ -1552,6 +1578,9 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
         block_set_base( &entry->block, heap );
         if (i) list_add_after( &entry[-1].entry, &entry->entry );
     }
+
+    /* Initialize free list bitmap to all zeros (all lists empty) */
+    memset( heap->free_list_bitmap, 0, sizeof(heap->free_list_bitmap) );
 
     if (!process_heap)  /* do it by hand to avoid memory allocations */
     {
