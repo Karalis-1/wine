@@ -1106,60 +1106,76 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 }
 
 
-static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
+static struct block *find_free_block(struct heap *heap, ULONG flags, SIZE_T block_size)
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    struct list *head = &heap->free_lists[0].entry;
+    struct list *ptr = head;
     struct entry *entry;
     struct block *block;
-    SIZE_T total_size;
-    SUBHEAP *subheap;
-
-    /* Find a suitable free list, and in it find a block large enough */
-
     SIZE_T scanned = 0;
 
-    while ((ptr = list_next(&heap->free_lists[0].entry, ptr)))
+    while ((ptr = list_next(head, ptr)))
     {
-        if (++scanned >= 512)
-            break;
-    
         entry = LIST_ENTRY(ptr, struct entry, entry);
         block = &entry->block;
-    
+
+        /* fast reject first (most likely to fail) */
         if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
             continue;
-    
-        if (block_get_size(block) >= block_size)
+
+        if (block_get_size(block) < block_size)
+            continue;
+
+        if (subheap_commit(heap,
+                           block_get_subheap(heap, block),
+                           block,
+                           block_size))
         {
-            if (!subheap_commit(heap,
-                                block_get_subheap(heap, block),
-                                block,
-                                block_size))
-                return NULL;
-            
             list_remove(&entry->entry);
             return block;
         }
+
+        /* commit failed → still consume scan budget */
+        if (++scanned >= 512)
+            break;
     }
 
-    /* make sure we can fit the block and a free entry at the end */
-    total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
-    if (total_size < block_size) return NULL;  /* overflow */
+    /* overflow-safe size computation */
+    SIZE_T total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
+    if (total_size < block_size)
+        return NULL;
 
-    if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
+    SUBHEAP *subheap = create_subheap(
+        heap,
+        flags,
+        max(heap->grow_size, total_size),
+        total_size
+    );
+
+    if (subheap)
     {
-        heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
+        heap->grow_size = min(heap->grow_size * 2, HEAP_MAX_GROW_SIZE);
     }
-    else while (!subheap)  /* shrink the grow size again if we are running out of space */
+    else
     {
-        if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
-        heap->grow_size /= 2;
-        subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
+        while (!subheap)
+        {
+            if (heap->grow_size <= total_size ||
+                heap->grow_size <= 4 * 1024 * 1024)
+                return NULL;
+
+            heap->grow_size /= 2;
+
+            subheap = create_subheap(
+                heap,
+                flags,
+                max(heap->grow_size, total_size),
+                total_size
+            );
+        }
     }
 
-    TRACE( "created new sub-heap %p of %#Ix bytes for heap %p\n", subheap, subheap_size( subheap ), heap );
-
-    return first_block( subheap );
+    return first_block(subheap);
 }
 
 
