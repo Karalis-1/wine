@@ -1136,8 +1136,8 @@ static struct block *find_free_block(struct heap *heap, ULONG flags, SIZE_T bloc
         }
 
         /* commit failed → still consume scan budget */
-        if (++scanned >= 512)
-            break;
+        //if (++scanned >= 512)
+        //    break;
     }
 
     /* overflow-safe size computation */
