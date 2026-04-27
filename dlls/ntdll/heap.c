@@ -1750,7 +1750,7 @@ static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T bloc
 
     /* Locate a suitable free block */
 
-    if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
+    if (!(block = find_free_block( heap, block_size ))) return STATUS_NO_MEMORY;
     /* read the free block size, changing block type or flags may alter it */
     old_block_size = block_get_size( block );
     subheap = block_get_subheap( heap, block );
