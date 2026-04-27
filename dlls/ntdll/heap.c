@@ -309,8 +309,6 @@ struct heap
     struct block   **pending_free;  /* Ring buffer for pending free requests */
     RTL_CRITICAL_SECTION cs;
     struct entry     free_lists[FREE_LIST_COUNT];
-    /* Bitmap tracking which free lists have blocks (1 = has blocks, 0 = empty) */
-    UINT64           free_list_bitmap[(FREE_LIST_COUNT + 63) / 64];
     struct bin      *bins;
     SUBHEAP          subheap;
 };
@@ -882,7 +880,6 @@ static void insert_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap,
 {
     struct entry *entry = (struct entry *)block, *list;
     struct block *next;
-    unsigned int index;
 
     if ((next = next_block( subheap, block )))
     {
@@ -895,10 +892,6 @@ static void insert_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap,
     list = find_free_list( heap, block_get_size( block ), !next );
     if (!next) list_add_before( &list->entry, &entry->entry );
     else list_add_after( &list->entry, &entry->entry );
-
-    /* Update bitmap to mark this free list as non-empty */
-    index = get_free_list_index( block_get_size( block ) );
-    heap->free_list_bitmap[index / 64] |= (UINT64)1 << (index % 64);
 }
 
 
@@ -1123,69 +1116,62 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 }
 
 
-struct block *find_free_block(struct heap *heap, SIZE_T block_size)
+static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
-    unsigned int index = get_free_list_index(block_size);
-    struct entry *list;
-    struct list *ptr;
+    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    struct entry *entry;
+    struct block *block;
+    SIZE_T total_size;
+    SUBHEAP *subheap;
 
-    /* O(1): Use bitmap to quickly find non-empty free lists */
-    while (index < FREE_LIST_COUNT)
+    /* Find a suitable free list, and in it find a block large enough */
+
+    SIZE_T scanned = 0;
+
+    while ((ptr = list_next(&heap->free_lists[0].entry, ptr)))
     {
-        /* Check bitmap first - O(1) check */
-        if (!(heap->free_list_bitmap[index / 64] & ((UINT64)1 << (index % 64))))
-        {
-            /* This free list is empty, skip to next one */
-            index++;
+        if (++scanned >= 2048)
+            break;
+
+        entry = LIST_ENTRY(ptr, struct entry, entry);
+        block = &entry->block;
+
+        if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
             continue;
-        }
 
-        list = &heap->free_lists[index];
-
-        /* Check blocks in this free list */
-        ptr = list->entry.next;
-        while (ptr != &list->entry)
+        if (block_get_size(block) >= block_size)
         {
-            struct entry *entry = LIST_ENTRY(ptr, struct entry, entry);
-            struct block *block = &entry->block;
+            if (!subheap_commit(heap,
+                                block_get_subheap(heap, block),
+                                block,
+                                block_size))
+                return NULL;
 
-            ptr = ptr->next;
-
-            /* Skip free link blocks (already being freed) */
-            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
-                continue;
-
-            /* Check if this block is large enough */
-            if (block_get_size(block) >= block_size)
-            {
-                heap->scan.ptr = NULL; /* reset scan state */
-
-                if (!subheap_commit(heap,
-                                    block_get_subheap(heap, block),
-                                    block,
-                                    block_size))
-                    return NULL;
-
-                list_remove(&entry->entry);
-
-                /* Check if this free list is now empty and update bitmap */
-                if (list->entry.next == &list->entry)
-                {
-                    heap->free_list_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
-                }
-
-                return block;
-            }
+            list_remove(&entry->entry);
+            return block;
         }
-
-        /* This list had blocks but none fit - clear bitmap bit and continue */
-        heap->free_list_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
-        index++;
     }
 
-    heap->scan.ptr = NULL;
-    return NULL;
+    /* make sure we can fit the block and a free entry at the end */
+    total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
+    if (total_size < block_size) return NULL;  /* overflow */
+
+    if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
+    {
+        heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
+    }
+    else while (!subheap)  /* shrink the grow size again if we are running out of space */
+    {
+        if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
+        heap->grow_size /= 2;
+        subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
+    }
+
+    TRACE( "created new sub-heap %p of %#Ix bytes for heap %p\n", subheap, subheap_size( subheap ), heap );
+
+    return first_block( subheap );
 }
+
 
 static BOOL is_valid_free_block( const struct heap *heap, const struct block *block )
 {
@@ -1579,9 +1565,6 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
         if (i) list_add_after( &entry[-1].entry, &entry->entry );
     }
 
-    /* Initialize free list bitmap to all zeros (all lists empty) */
-    memset( heap->free_list_bitmap, 0, sizeof(heap->free_list_bitmap) );
-
     if (!process_heap)  /* do it by hand to avoid memory allocations */
     {
         heap->cs.DebugInfo      = &process_heap_cs_debug;
@@ -1750,7 +1733,7 @@ static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T bloc
 
     /* Locate a suitable free block */
 
-    if (!(block = find_free_block( heap, block_size ))) return STATUS_NO_MEMORY;
+    if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
     /* read the free block size, changing block type or flags may alter it */
     old_block_size = block_get_size( block );
     subheap = block_get_subheap( heap, block );
