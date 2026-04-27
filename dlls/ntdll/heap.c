@@ -42,7 +42,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(heap);
 #define HEAP_STD 0
 #define HEAP_LAL 1
 #define HEAP_LFH 2
+#define HEAP_BIN_COUNT 32  /* supports up to 2^31-ish sizes */
 
+
+struct heap_bin
+{
+    struct list free_list;
+};
 
 /* undocumented RtlWalkHeap structure */
 
@@ -301,6 +307,9 @@ struct heap
     struct entry     free_lists[FREE_LIST_COUNT];
     struct bin      *bins;
     SUBHEAP          subheap;
+
+    struct heap_bin bins[HEAP_BIN_COUNT];
+    SIZE_T grow_size;
 };
 
 /* subheap must be last and aligned */
@@ -347,6 +356,24 @@ static inline UINT block_get_flags( const struct block *block )
 static inline UINT block_get_type( const struct block *block )
 {
     return block->block_type;
+}
+
+static inline unsigned int size_to_bin(SIZE_T size)
+{
+    unsigned int bin = 0;
+
+    size = size >> 4; /* align baseline (16-byte minimum class) */
+
+    while (size > 1)
+    {
+        size >>= 1;
+        bin++;
+    }
+
+    if (bin >= HEAP_BIN_COUNT)
+        bin = HEAP_BIN_COUNT - 1;
+
+    return bin;
 }
 
 static inline void block_set_base( struct block *block, const void *base )
@@ -866,22 +893,29 @@ static void block_init_free( struct block *block, ULONG flags, SUBHEAP *subheap,
     if (end > (char *)(entry + 1)) mark_block_free( entry + 1, end - (char *)(entry + 1), flags );
 }
 
-static void insert_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap, struct block *block )
+static void insert_free_block(struct heap *heap, ULONG flags, SUBHEAP *subheap, struct block *block)
 {
-    struct entry *entry = (struct entry *)block, *list;
+    struct entry *entry = (struct entry *)block;
     struct block *next;
+    SIZE_T size;
+    unsigned int bin;
 
-    if ((next = next_block( subheap, block )))
+    /* coalescing logic (KEEP) */
+    if ((next = next_block(subheap, block)))
     {
-        /* set the next block PREV_FREE flag and back pointer */
-        block_set_flags( next, 0, BLOCK_FLAG_PREV_FREE );
-        valgrind_make_writable( (struct block **)next - 1, sizeof(struct block *) );
+        block_set_flags(next, 0, BLOCK_FLAG_PREV_FREE);
+        valgrind_make_writable((struct block **)next - 1, sizeof(struct block *));
         *((struct block **)next - 1) = block;
     }
 
-    list = find_free_list( heap, block_get_size( block ), !next );
-    if (!next) list_add_before( &list->entry, &entry->entry );
-    else list_add_after( &list->entry, &entry->entry );
+    /* compute final size AFTER coalescing */
+    size = block_get_size(block);
+
+    /* map to bin */
+    bin = size_to_bin(size);
+
+    /* insert into bin (NO ordering logic needed) */
+    list_add_head(&heap->bins[bin].free_list, &entry->entry);
 }
 
 
@@ -1105,61 +1139,54 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
     return subheap;
 }
 
-
-static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
+static struct block *find_free_block(struct heap *heap, ULONG flags, SIZE_T size)
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
-    struct entry *entry;
-    struct block *block;
-    SIZE_T total_size;
-    SUBHEAP *subheap;
+    unsigned int bin = size_to_bin(size);
 
-    /* Find a suitable free list, and in it find a block large enough */
-
-    SIZE_T scanned = 0;
-
-    while ((ptr = list_next(&heap->free_lists[0].entry, ptr)))
+    /* search current bin + a few above it */
+    for (unsigned int i = bin; i < HEAP_BIN_COUNT && i < bin + 4; i++)
     {
-        if (++scanned >= 2048)
-            break;
+        struct list *head = &heap->bins[i].free_list;
+        struct list *ptr = head->next;
 
-        entry = LIST_ENTRY(ptr, struct entry, entry);
-        block = &entry->block;
-
-        if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
-            continue;
-
-        if (block_get_size(block) >= block_size)
+        while (ptr != head)
         {
-            if (!subheap_commit(heap,
-                                block_get_subheap(heap, block),
-                                block,
-                                block_size))
-                return NULL;
+            struct entry *entry = LIST_ENTRY(ptr, struct entry, entry);
+            struct block *block = &entry->block;
 
-            list_remove(&entry->entry);
-            return block;
+                ptr = ptr->next;
+
+            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+                continue;
+
+            if (block_get_size(block) >= size)
+            {
+                list_remove(&entry->entry);
+
+                subheap_commit(heap,
+                               block_get_subheap(heap, block),
+                               block,
+                               size);
+
+                return block;
+            }
         }
     }
 
-    /* make sure we can fit the block and a free entry at the end */
-    total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
-    if (total_size < block_size) return NULL;  /* overflow */
+    /* fallback: create new subheap */
+    SIZE_T total_size = sizeof(SUBHEAP) + size + sizeof(struct entry);
 
-    if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
-    {
-        heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
-    }
-    else while (!subheap)  /* shrink the grow size again if we are running out of space */
-    {
-        if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
-        heap->grow_size /= 2;
-        subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
-    }
+    struct subheap *subheap =
+        create_subheap(heap, flags,
+                       max(heap->grow_size, total_size),
+                       total_size);
 
-    TRACE( "created new sub-heap %p of %#Ix bytes for heap %p\n", subheap, subheap_size( subheap ), heap );
+    if (!subheap)
+        return NULL;
 
-    return first_block( subheap );
+    heap->grow_size = min(heap->grow_size * 2, HEAP_MAX_GROW_SIZE);
+
+    return first_block(subheap);
 }
 
 
@@ -1510,52 +1537,86 @@ static void heap_set_debug_flags( HANDLE handle )
  *           RtlCreateHeap   (NTDLL.@)
  */
 HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T commit_size,
-                             void *lock, RTL_HEAP_PARAMETERS *params )
+                              void *lock, RTL_HEAP_PARAMETERS *params )
 {
-    struct entry *entry;
     struct heap *heap;
-    SIZE_T block_size;
+    struct entry *entry;
     SUBHEAP *subheap;
+    SIZE_T block_size;
     unsigned int i;
 
-    TRACE( "flags %#lx, addr %p, total_size %#Ix, commit_size %#Ix, lock %p, params %p\n",
-           flags, addr, total_size, commit_size, lock, params );
+    TRACE("flags %#lx, addr %p, total_size %#Ix, commit_size %#Ix, lock %p, params %p\n",
+          flags, addr, total_size, commit_size, lock, params);
 
-    flags &= ~(HEAP_TAIL_CHECKING_ENABLED|HEAP_FREE_CHECKING_ENABLED);
+    /* ---------------------------- */
+    /* flags / sizing normalization */
+    /* ---------------------------- */
+
+    flags &= ~(HEAP_TAIL_CHECKING_ENABLED | HEAP_FREE_CHECKING_ENABLED);
+
     if (process_heap) flags |= HEAP_PRIVATE;
-    if (!process_heap || !total_size || (flags & HEAP_SHARED)) flags |= HEAP_GROWABLE;
-    commit_size = ROUND_SIZE( commit_size, INITIAL_COMMIT_ALIGN - 1 );
-    if (!total_size) total_size = ROUND_SIZE( commit_size + 1 /* + 1 is intentional */, REGION_ALIGN - 1 );
+    if (!process_heap || !total_size || (flags & HEAP_SHARED))
+        flags |= HEAP_GROWABLE;
+
+    commit_size = ROUND_SIZE(commit_size, INITIAL_COMMIT_ALIGN - 1);
+
+    if (!total_size)
+        total_size = ROUND_SIZE(commit_size + 1, REGION_ALIGN - 1);
+
+    /* ---------------------------- */
+    /* heap allocation */
+    /* ---------------------------- */
 
     if (!(heap = addr))
     {
-        if (!commit_size) commit_size = REGION_ALIGN;
-        total_size = min( max( total_size, commit_size ), 0xffff0000 );  /* don't allow a heap larger than 4GB */
-        commit_size = min( total_size, ROUND_SIZE( commit_size, REGION_ALIGN - 1 ) );
-        if (!(heap = allocate_region( NULL, flags, &total_size, &commit_size ))) return 0;
+        if (!commit_size)
+            commit_size = REGION_ALIGN;
+
+        total_size = min(max(total_size, commit_size), 0xffff0000);
+        commit_size = min(total_size,
+                           ROUND_SIZE(commit_size, REGION_ALIGN - 1));
+
+        if (!(heap = allocate_region(NULL, flags, &total_size, &commit_size)))
+            return 0;
     }
 
-    heap->ffeeffee      = 0xffeeffee;
-    heap->auto_flags    = (flags & HEAP_GROWABLE);
-    heap->flags         = (flags & ~HEAP_SHARED);
-    heap->compat_info   = HEAP_STD;
-    heap->magic         = HEAP_MAGIC;
-    heap->grow_size     = HEAP_INITIAL_GROW_SIZE;
-    heap->min_size      = commit_size;
-    list_init( &heap->subheap_list );
-    list_init( &heap->large_list );
+    /* ---------------------------- */
+    /* heap metadata init */
+    /* ---------------------------- */
 
-    list_init( &heap->free_lists[0].entry );
+    heap->ffeeffee    = 0xffeeffee;
+    heap->auto_flags  = (flags & HEAP_GROWABLE);
+    heap->flags       = (flags & ~HEAP_SHARED);
+    heap->compat_info = HEAP_STD;
+    heap->magic       = HEAP_MAGIC;
+    heap->grow_size   = HEAP_INITIAL_GROW_SIZE;
+    heap->min_size    = commit_size;
+
+    list_init(&heap->subheap_list);
+    list_init(&heap->large_list);
+
+    /* ---------------------------- */
+    /* legacy free list (KEEP FOR COMPAT) */
+    /* ---------------------------- */
+
+    list_init(&heap->free_lists[0].entry);
+
     for (i = 0, entry = heap->free_lists; i < FREE_LIST_COUNT; i++, entry++)
     {
-        block_set_flags( &entry->block, ~0, BLOCK_FLAG_FREE_LINK );
-        block_set_size( &entry->block, 0 );
-        block_set_type( &entry->block, BLOCK_TYPE_FREE );
-        block_set_base( &entry->block, heap );
-        if (i) list_add_after( &entry[-1].entry, &entry->entry );
+        block_set_flags(&entry->block, ~0, BLOCK_FLAG_FREE_LINK);
+        block_set_size(&entry->block, 0);
+        block_set_type(&entry->block, BLOCK_TYPE_FREE);
+        block_set_base(&entry->block, heap);
+
+        if (i)
+            list_add_after(&entry[-1].entry, &entry->entry);
     }
 
-    if (!process_heap)  /* do it by hand to avoid memory allocations */
+    /* ---------------------------- */
+    /* CRITICAL SECTION SETUP */
+    /* ---------------------------- */
+
+    if (!process_heap)
     {
         heap->cs.DebugInfo      = &process_heap_cs_debug;
         heap->cs.LockCount      = -1;
@@ -1563,50 +1624,97 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
         heap->cs.OwningThread   = 0;
         heap->cs.LockSemaphore  = 0;
         heap->cs.SpinCount      = 0;
+
         process_heap_cs_debug.CriticalSection = &heap->cs;
     }
     else
     {
-        RtlInitializeCriticalSectionEx( &heap->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
-        heap->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": heap.cs");
+        RtlInitializeCriticalSectionEx(&heap->cs, 0,
+                                       RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+
+        heap->cs.DebugInfo->Spare[0] =
+            (DWORD_PTR)(__FILE__ ": heap.cs");
     }
+
+    /* ---------------------------- */
+    /* BIN SYSTEM INITIALIZATION (NEW CORE) */
+    /* ---------------------------- */
+
+    heap->bin_count = HEAP_BIN_COUNT;
+
+    for (i = 0; i < HEAP_BIN_COUNT; i++)
+    {
+        list_init(&heap->bins[i].free_list);
+        heap->bins[i].cached_block = NULL; /* optional hot-cache */
+    }
+
+    /* ---------------------------- */
+    /* INITIAL SUBHEAP */
+    /* ---------------------------- */
 
     subheap = &heap->subheap;
     subheap->user_value = heap;
-    subheap_set_bounds( subheap, (char *)heap + commit_size, (char *)heap + total_size );
-    block_size = (SIZE_T)ROUND_ADDR( subheap_size( subheap ) - subheap_overhead( subheap ), BLOCK_ALIGN - 1 );
-    block_init_free( first_block( subheap ), flags, subheap, block_size );
 
-    insert_free_block( heap, flags, subheap, first_block( subheap ) );
-    list_add_head( &heap->subheap_list, &subheap->entry );
+    subheap_set_bounds(subheap,
+                       (char *)heap + commit_size,
+                       (char *)heap + total_size);
 
-    heap_set_debug_flags( heap );
+    block_size =
+        (SIZE_T)ROUND_ADDR(subheap_size(subheap) - subheap_overhead(subheap),
+                           BLOCK_ALIGN - 1);
+
+    block_init_free(first_block(subheap), flags, subheap, block_size);
+
+    /* IMPORTANT: enters BIN SYSTEM here */
+    insert_free_block(heap, flags, subheap, first_block(subheap));
+
+    list_add_head(&heap->subheap_list, &subheap->entry);
+
+    /* ---------------------------- */
+    /* DEBUG FLAGS */
+    /* ---------------------------- */
+
+    heap_set_debug_flags(heap);
+
+    /* ---------------------------- */
+    /* OPTIONAL WIN32 BIN GROUP SYSTEM (UNCHANGED) */
+    /* ---------------------------- */
 
     if (heap->flags & HEAP_GROWABLE)
     {
-        SIZE_T size = (sizeof(struct bin) + sizeof(struct group *) * ARRAY_SIZE(affinity_mapping)) * BLOCK_SIZE_BIN_COUNT;
-        NtAllocateVirtualMemory( NtCurrentProcess(), (void *)&heap->bins,
-                                 0, &size, MEM_COMMIT, PAGE_READWRITE );
+        SIZE_T size =
+            (sizeof(struct bin) +
+             sizeof(struct group *) * ARRAY_SIZE(affinity_mapping)) *
+            BLOCK_SIZE_BIN_COUNT;
 
-        for (i = 0; heap->bins && i < BLOCK_SIZE_BIN_COUNT; ++i)
+        NtAllocateVirtualMemory(NtCurrentProcess(),
+                                (void *)&heap->bins,
+                                0, &size,
+                                MEM_COMMIT,
+                                PAGE_READWRITE);
+
+        for (i = 0; heap->bins && i < BLOCK_SIZE_BIN_COUNT; i++)
         {
-            RtlInitializeSListHead( &heap->bins[i].groups );
-            /* offset affinity_group_base to interleave the bin affinity group pointers */
-            heap->bins[i].affinity_group_base = (struct group **)(heap->bins + BLOCK_SIZE_BIN_COUNT) + i;
+            RtlInitializeSListHead(&heap->bins[i].groups);
+            heap->bins[i].affinity_group_base =
+                (struct group **)(heap->bins + BLOCK_SIZE_BIN_COUNT) + i;
         }
     }
 
-    /* link it into the per-process heap list */
+    /* ---------------------------- */
+    /* PROCESS HEAP LINKING */
+    /* ---------------------------- */
+
     if (process_heap)
     {
-        RtlEnterCriticalSection( &process_heap->cs );
-        list_add_head( &process_heap->entry, &heap->entry );
-        RtlLeaveCriticalSection( &process_heap->cs );
+        RtlEnterCriticalSection(&process_heap->cs);
+        list_add_head(&process_heap->entry, &heap->entry);
+        RtlLeaveCriticalSection(&process_heap->cs);
     }
     else if (!addr)
     {
-        process_heap = heap;  /* assume the first heap we create is the process main heap */
-        list_init( &process_heap->entry );
+        process_heap = heap;
+        list_init(&process_heap->entry);
     }
 
     return heap;
