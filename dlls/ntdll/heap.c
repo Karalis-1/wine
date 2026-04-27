@@ -1116,16 +1116,28 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
 
     /* Find a suitable free list, and in it find a block large enough */
 
-    while ((ptr = list_next( &heap->free_lists[0].entry, ptr )))
+    SIZE_T scanned = 0;
+
+    while ((ptr = list_next(&heap->free_lists[0].entry, ptr)))
     {
-        break;
-        entry = LIST_ENTRY( ptr, struct entry, entry );
+        if (++scanned >= 512)
+            break;
+    
+        entry = LIST_ENTRY(ptr, struct entry, entry);
         block = &entry->block;
-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
-        if (block_get_size( block ) >= block_size)
+    
+        if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+            continue;
+    
+        if (block_get_size(block) >= block_size)
         {
-            if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
-            list_remove( &entry->entry );
+            if (!subheap_commit(heap,
+                                block_get_subheap(heap, block),
+                                block,
+                                block_size))
+                return NULL;
+            
+            list_remove(&entry->entry);
             return block;
         }
     }
