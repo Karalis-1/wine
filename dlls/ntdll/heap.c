@@ -26,6 +26,7 @@
 #include <string.h>
 
 #define RUNNING_ON_VALGRIND 0  /* FIXME */
+#define FREE_SCAN_LIMIT 64
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -1106,47 +1107,97 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 }
 
 
-static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
+static struct block *find_free_block(struct heap *heap, ULONG flags, SIZE_T block_size)
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    struct list *free_list;
+    struct list *ptr;
     struct entry *entry;
     struct block *block;
     SIZE_T total_size;
     SUBHEAP *subheap;
+    int scanned = 0;
 
-    /* Find a suitable free list, and in it find a block large enough */
-
-    while ((ptr = list_next( &find_free_list( heap, block_size, TRUE )->entry, ptr )))
+    /* -------------------------
+     * Fast path: cache reuse
+     * ------------------------- */
+    struct block *cached = heap->last_block_cache;
+    if (cached &&
+        block_get_flags(cached) == BLOCK_FLAG_FREE &&
+        block_get_size(cached) >= block_size)
     {
-        entry = LIST_ENTRY( ptr, struct entry, entry );
+        return cached;
+    }
+
+    /* -------------------------
+     * Get free list ONCE
+     * ------------------------- */
+    free_list = &find_free_list(heap, block_size, TRUE)->entry;
+    ptr = free_list;
+
+    /* -------------------------
+     * Bounded scan (prevents spikes)
+     * ------------------------- */
+    while ((ptr = list_next(free_list, ptr)))
+    {
+        if (++scanned > FREE_SCAN_LIMIT)
+            break;
+
+        entry = LIST_ENTRY(ptr, struct entry, entry);
         block = &entry->block;
-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
-        if (block_get_size( block ) >= block_size)
+
+        if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+            continue;
+
+        if (block_get_size(block) >= block_size)
         {
-            if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
-            list_remove( &entry->entry );
+            subheap = block_get_subheap(heap, block);
+
+            if (!subheap_commit(heap, subheap, block, block_size))
+                return NULL;
+
+            list_remove(&entry->entry);
+
+            heap->last_block_cache = block;  /* cache update */
+
             return block;
         }
     }
 
-    /* make sure we can fit the block and a free entry at the end */
+    /* -------------------------
+     * Fallback: grow heap
+     * ------------------------- */
     total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
-    if (total_size < block_size) return NULL;  /* overflow */
 
-    if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
+    if (total_size < block_size)
+        return NULL;
+
+    if ((subheap = create_subheap(
+            heap,
+            flags,
+            max(heap->grow_size, total_size),
+            total_size)))
     {
-        heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
+        heap->grow_size = min(heap->grow_size * 2, HEAP_MAX_GROW_SIZE);
     }
-    else while (!subheap)  /* shrink the grow size again if we are running out of space */
+    else while (!subheap)
     {
-        if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
+        if (heap->grow_size <= total_size ||
+            heap->grow_size <= 4 * 1024 * 1024)
+            return NULL;
+
         heap->grow_size /= 2;
-        subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
+
+        subheap = create_subheap(
+            heap,
+            flags,
+            max(heap->grow_size, total_size),
+            total_size);
     }
 
-    TRACE( "created new sub-heap %p of %#Ix bytes for heap %p\n", subheap, subheap_size( subheap ), heap );
+    TRACE("created new sub-heap %p of %#Ix bytes for heap %p\n",
+          subheap, subheap_size(subheap), heap);
 
-    return first_block( subheap );
+    return first_block(subheap);
 }
 
 
