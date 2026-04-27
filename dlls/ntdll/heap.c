@@ -1116,7 +1116,7 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
 
     /* Find a suitable free list, and in it find a block large enough */
 
-    while ((ptr = list_next( &heap->free_lists[0].entry, ptr )))
+    while ((ptr = list_next( &find_free_list( heap, block_size, TRUE )->entry, ptr )))
     {
         entry = LIST_ENTRY( ptr, struct entry, entry );
         block = &entry->block;
