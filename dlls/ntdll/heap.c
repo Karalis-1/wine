@@ -1748,87 +1748,6 @@ static NTSTATUS heap_allocate_block_lfh( struct heap *heap, ULONG flags, SIZE_T 
     return block ? STATUS_SUCCESS : STATUS_NO_MEMORY;
 }
 
-/* release a thread owned and fully freed group to the bin shared group, or free its memory */
-static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct bin *bin, struct group *group )
-{
-    ULONG affinity = group->affinity;
-
-    /* using InterlockedExchangePointer here would possibly return a group that has used blocks,
-     * we prefer keeping our fully freed group instead for reduced memory consumption.
-     */
-    if (!InterlockedCompareExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), group, NULL ))
-        return STATUS_SUCCESS;
-
-    /* try re-using the block group instead of releasing it */
-    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
-    {
-        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
-        return STATUS_SUCCESS;
-    }
-
-    return group_release( heap, flags, bin, group );
-}
-
-static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block )
-{
-    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
-    SIZE_T i, block_size = block_get_size( block );
-    struct group *group = block_get_group( block );
-    NTSTATUS status = STATUS_SUCCESS;
-
-    if (!(block_get_flags( block ) & BLOCK_FLAG_LFH)) return STATUS_UNSUCCESSFUL;
-
-    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
-    if (bin == last) return STATUS_UNSUCCESSFUL;
-
-    i = block_get_group_index( block );
-    valgrind_make_writable( block, sizeof(*block) );
-    block_set_type( block, BLOCK_TYPE_FREE );
-    block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_FLAG_FREE );
-    mark_block_free( block + 1, (char *)block + block_size - (char *)(block + 1), flags );
-
-    /* if this was the last used block in a group and GROUP_FLAG_FREE was set */
-    if (InterlockedOr( &group->free_bits, 1 << i ) == ~(1 << i))
-    {
-        /* thread now owns the group, and can release it to its bin */
-        group->free_bits = ~GROUP_FLAG_FREE;
-        status = heap_release_bin_group( heap, flags, bin, group );
-    }
-
-    return status;
-}
-
-static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
-{
-    return heap_allocate_block_lfh( heap, flags, block_size, size, ret );
-    struct block *block, *next;
-    SIZE_T old_block_size;
-    SUBHEAP *subheap;
-    /* Locate a suitable free block */
-
-    if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
-    /* read the free block size, changing block type or flags may alter it */
-    old_block_size = block_get_size( block );
-    subheap = block_get_subheap( heap, block );
-
-    if ((next = split_block( heap, flags, block, old_block_size, block_size )))
-    {
-        block_init_free( next, flags, subheap, old_block_size - block_size );
-        insert_free_block( heap, flags, subheap, next );
-    }
-
-    block_set_type( block, BLOCK_TYPE_USED );
-    block_set_flags( block, ~0, BLOCK_USER_FLAGS( flags ) );
-    block->tail_size = block_get_size( block ) - sizeof(*block) - size;
-    initialize_block( block, 0, size, flags );
-    mark_block_tail( block, flags );
-
-    if ((next = next_block( subheap, block ))) block_set_flags( next, BLOCK_FLAG_PREV_FREE, 0 );
-
-    *ret = block + 1;
-    return STATUS_SUCCESS;
-}
-
 /* Low Fragmentation Heap frontend */
 
 /* header for every LFH block group */
@@ -2035,6 +1954,88 @@ static void heap_thread_detach_bin_groups( struct heap *heap )
         if (!(group = InterlockedExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), NULL ))) continue;
         RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
     }
+}
+
+
+/* release a thread owned and fully freed group to the bin shared group, or free its memory */
+static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct bin *bin, struct group *group )
+{
+    ULONG affinity = group->affinity;
+
+    /* using InterlockedExchangePointer here would possibly return a group that has used blocks,
+     * we prefer keeping our fully freed group instead for reduced memory consumption.
+     */
+    if (!InterlockedCompareExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), group, NULL ))
+        return STATUS_SUCCESS;
+
+    /* try re-using the block group instead of releasing it */
+    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
+    {
+        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
+        return STATUS_SUCCESS;
+    }
+
+    return group_release( heap, flags, bin, group );
+}
+
+static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block )
+{
+    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
+    SIZE_T i, block_size = block_get_size( block );
+    struct group *group = block_get_group( block );
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!(block_get_flags( block ) & BLOCK_FLAG_LFH)) return STATUS_UNSUCCESSFUL;
+
+    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
+    if (bin == last) return STATUS_UNSUCCESSFUL;
+
+    i = block_get_group_index( block );
+    valgrind_make_writable( block, sizeof(*block) );
+    block_set_type( block, BLOCK_TYPE_FREE );
+    block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_FLAG_FREE );
+    mark_block_free( block + 1, (char *)block + block_size - (char *)(block + 1), flags );
+
+    /* if this was the last used block in a group and GROUP_FLAG_FREE was set */
+    if (InterlockedOr( &group->free_bits, 1 << i ) == ~(1 << i))
+    {
+        /* thread now owns the group, and can release it to its bin */
+        group->free_bits = ~GROUP_FLAG_FREE;
+        status = heap_release_bin_group( heap, flags, bin, group );
+    }
+
+    return status;
+}
+
+static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
+{
+    return heap_allocate_block_lfh( heap, flags, block_size, size, ret );
+    struct block *block, *next;
+    SIZE_T old_block_size;
+    SUBHEAP *subheap;
+    /* Locate a suitable free block */
+
+    if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
+    /* read the free block size, changing block type or flags may alter it */
+    old_block_size = block_get_size( block );
+    subheap = block_get_subheap( heap, block );
+
+    if ((next = split_block( heap, flags, block, old_block_size, block_size )))
+    {
+        block_init_free( next, flags, subheap, old_block_size - block_size );
+        insert_free_block( heap, flags, subheap, next );
+    }
+
+    block_set_type( block, BLOCK_TYPE_USED );
+    block_set_flags( block, ~0, BLOCK_USER_FLAGS( flags ) );
+    block->tail_size = block_get_size( block ) - sizeof(*block) - size;
+    initialize_block( block, 0, size, flags );
+    mark_block_tail( block, flags );
+
+    if ((next = next_block( subheap, block ))) block_set_flags( next, BLOCK_FLAG_PREV_FREE, 0 );
+
+    *ret = block + 1;
+    return STATUS_SUCCESS;
 }
 
 void heap_thread_detach(void)
