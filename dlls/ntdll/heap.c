@@ -918,6 +918,7 @@ static struct block *heap_delay_free( struct heap *heap, ULONG flags, struct blo
 
 static NTSTATUS heap_free_block( struct heap *heap, ULONG flags, struct block *block )
 {
+    return heap_free_block_lfh( heap, flags, block );
     SUBHEAP *subheap = block_get_subheap( heap, block );
     SIZE_T block_size = block_get_size( block );
     struct entry *entry;
@@ -1723,10 +1724,10 @@ static SIZE_T heap_get_block_size( const struct heap *heap, ULONG flags, SIZE_T 
 
 static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
 {
+    return heap_allocate_block_lfh( heap, flags, block_size, size, ret );
     struct block *block, *next;
     SIZE_T old_block_size;
     SUBHEAP *subheap;
-
     /* Locate a suitable free block */
 
     if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
