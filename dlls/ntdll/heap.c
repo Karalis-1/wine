@@ -206,7 +206,7 @@ C_ASSERT( sizeof(SUBHEAP) == 4 * BLOCK_ALIGN );
 #define BIN_SIZE_MIN_5   0x1000
 #define BIN_SIZE_MIN_6   0x2000
 #define BIN_SIZE_MIN_7   0x4000
-#define BIN_SIZE_MAX     0x8000
+#define BIN_SIZE_MAX     0x1400000
 
 #define BIN_SIZE_STEP_0                   (16)
 #define BIN_SIZE_STEP_1  (BIN_SIZE_MIN_1 >> 4)
@@ -1998,7 +1998,7 @@ static void bin_try_enable( struct heap *heap, struct bin *bin )
     ULONG alloc = ReadNoFence( &bin->count_alloc ), freed = ReadNoFence( &bin->count_freed );
     SIZE_T block_size = BLOCK_BIN_SIZE( bin - heap->bins );
     BOOL enable = TRUE;
-//
+
     //if (bin == heap->bins && alloc > 0x10) enable = TRUE;
     //else if (bin - heap->bins < 0x30 && alloc > 0x800) enable = TRUE;
     //else if (bin - heap->bins < 0x30 && alloc - freed > 0x10) enable = TRUE;
