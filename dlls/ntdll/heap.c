@@ -215,7 +215,7 @@ C_ASSERT( sizeof(SUBHEAP) == 4 * BLOCK_ALIGN );
 #define BIN_SIZE_STEP_4  (BIN_SIZE_MIN_4 >> 4)
 #define BIN_SIZE_STEP_5  (BIN_SIZE_MIN_5 >> 4)
 #define BIN_SIZE_STEP_6  (BIN_SIZE_MIN_6 >> 4)
-#define BIN_SIZE_STEP_7  (BIN_SIZE_MIN_7 >> 4)
+#define BIN_SIZE_STEP_7   ((BIN_SIZE_MAX - BIN_SIZE_MIN_7) >> 4)
 
 #define BLOCK_BIN_SIZE_N( n, bin )   (BIN_SIZE_MIN_##n + (bin + 1) * BIN_SIZE_STEP_##n)
 #define BLOCK_SIZE_BIN_N( n, size )  (((size) - 1 - BIN_SIZE_MIN_##n) / BIN_SIZE_STEP_##n)
