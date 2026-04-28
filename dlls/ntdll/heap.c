@@ -43,7 +43,18 @@ WINE_DEFAULT_DEBUG_CHANNEL(heap);
 #define HEAP_LAL 1
 #define HEAP_LFH 2
 
+static NTSTATUS heap_release_bin_group(
+    struct heap *heap,
+    ULONG flags,
+    struct bin *bin,
+    struct group *group);
 
+static struct block *find_free_bin_block(
+    struct heap *heap,
+    ULONG flags,
+    SIZE_T block_size,
+    struct bin *bin);
+    
 /* undocumented RtlWalkHeap structure */
 
 struct rtl_heap_entry
