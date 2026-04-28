@@ -1722,6 +1722,62 @@ static SIZE_T heap_get_block_size( const struct heap *heap, ULONG flags, SIZE_T 
     return block_size;
 }
 
+static NTSTATUS heap_allocate_block_lfh( struct heap *heap, ULONG flags, SIZE_T block_size,
+                                         SIZE_T size, void **ret )
+{
+    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
+    struct block *block;
+
+    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
+    if (bin == last) return STATUS_UNSUCCESSFUL;
+
+    /* paired with WriteRelease in bin_try_enable. */
+    if (!ReadAcquire( &bin->enabled )) return STATUS_UNSUCCESSFUL;
+
+    block_size = BLOCK_BIN_SIZE( BLOCK_SIZE_BIN( block_size ) );
+
+    if ((block = find_free_bin_block( heap, flags, block_size, bin )))
+    {
+        block_set_type( block, BLOCK_TYPE_USED );
+        block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_USER_FLAGS( flags ) );
+        block->tail_size = block_size - sizeof(*block) - size;
+        initialize_block( block, 0, size, flags );
+        mark_block_tail( block, flags );
+        *ret = block + 1;
+    }
+
+    return block ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+}
+
+static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block )
+{
+    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
+    SIZE_T i, block_size = block_get_size( block );
+    struct group *group = block_get_group( block );
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!(block_get_flags( block ) & BLOCK_FLAG_LFH)) return STATUS_UNSUCCESSFUL;
+
+    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
+    if (bin == last) return STATUS_UNSUCCESSFUL;
+
+    i = block_get_group_index( block );
+    valgrind_make_writable( block, sizeof(*block) );
+    block_set_type( block, BLOCK_TYPE_FREE );
+    block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_FLAG_FREE );
+    mark_block_free( block + 1, (char *)block + block_size - (char *)(block + 1), flags );
+
+    /* if this was the last used block in a group and GROUP_FLAG_FREE was set */
+    if (InterlockedOr( &group->free_bits, 1 << i ) == ~(1 << i))
+    {
+        /* thread now owns the group, and can release it to its bin */
+        group->free_bits = ~GROUP_FLAG_FREE;
+        status = heap_release_bin_group( heap, flags, bin, group );
+    }
+
+    return status;
+}
+
 static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
 {
     return heap_allocate_block_lfh( heap, flags, block_size, size, ret );
@@ -1936,62 +1992,6 @@ static struct block *find_free_bin_block( struct heap *heap, ULONG flags, SIZE_T
     }
 
     return block;
-}
-
-static NTSTATUS heap_allocate_block_lfh( struct heap *heap, ULONG flags, SIZE_T block_size,
-                                         SIZE_T size, void **ret )
-{
-    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
-    struct block *block;
-
-    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
-    if (bin == last) return STATUS_UNSUCCESSFUL;
-
-    /* paired with WriteRelease in bin_try_enable. */
-    if (!ReadAcquire( &bin->enabled )) return STATUS_UNSUCCESSFUL;
-
-    block_size = BLOCK_BIN_SIZE( BLOCK_SIZE_BIN( block_size ) );
-
-    if ((block = find_free_bin_block( heap, flags, block_size, bin )))
-    {
-        block_set_type( block, BLOCK_TYPE_USED );
-        block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_USER_FLAGS( flags ) );
-        block->tail_size = block_size - sizeof(*block) - size;
-        initialize_block( block, 0, size, flags );
-        mark_block_tail( block, flags );
-        *ret = block + 1;
-    }
-
-    return block ? STATUS_SUCCESS : STATUS_NO_MEMORY;
-}
-
-static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block )
-{
-    struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
-    SIZE_T i, block_size = block_get_size( block );
-    struct group *group = block_get_group( block );
-    NTSTATUS status = STATUS_SUCCESS;
-
-    if (!(block_get_flags( block ) & BLOCK_FLAG_LFH)) return STATUS_UNSUCCESSFUL;
-
-    bin = heap->bins + BLOCK_SIZE_BIN( block_size );
-    if (bin == last) return STATUS_UNSUCCESSFUL;
-
-    i = block_get_group_index( block );
-    valgrind_make_writable( block, sizeof(*block) );
-    block_set_type( block, BLOCK_TYPE_FREE );
-    block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_FLAG_FREE );
-    mark_block_free( block + 1, (char *)block + block_size - (char *)(block + 1), flags );
-
-    /* if this was the last used block in a group and GROUP_FLAG_FREE was set */
-    if (InterlockedOr( &group->free_bits, 1 << i ) == ~(1 << i))
-    {
-        /* thread now owns the group, and can release it to its bin */
-        group->free_bits = ~GROUP_FLAG_FREE;
-        status = heap_release_bin_group( heap, flags, bin, group );
-    }
-
-    return status;
 }
 
 static void bin_try_enable( struct heap *heap, struct bin *bin )
