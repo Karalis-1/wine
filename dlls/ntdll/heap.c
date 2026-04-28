@@ -206,7 +206,7 @@ C_ASSERT( sizeof(SUBHEAP) == 4 * BLOCK_ALIGN );
 #define BIN_SIZE_MIN_5   0x1000
 #define BIN_SIZE_MIN_6   0x2000
 #define BIN_SIZE_MIN_7   0x4000
-#define BIN_SIZE_MAX     0x1400000
+#define BIN_SIZE_MAX     0x8000
 
 #define BIN_SIZE_STEP_0                   (16)
 #define BIN_SIZE_STEP_1  (BIN_SIZE_MIN_1 >> 4)
@@ -215,7 +215,7 @@ C_ASSERT( sizeof(SUBHEAP) == 4 * BLOCK_ALIGN );
 #define BIN_SIZE_STEP_4  (BIN_SIZE_MIN_4 >> 4)
 #define BIN_SIZE_STEP_5  (BIN_SIZE_MIN_5 >> 4)
 #define BIN_SIZE_STEP_6  (BIN_SIZE_MIN_6 >> 4)
-#define BIN_SIZE_STEP_7   ((BIN_SIZE_MAX - BIN_SIZE_MIN_7) >> 4)
+#define BIN_SIZE_STEP_7  (BIN_SIZE_MIN_7 >> 4)
 
 #define BLOCK_BIN_SIZE_N( n, bin )   (BIN_SIZE_MIN_##n + (bin + 1) * BIN_SIZE_STEP_##n)
 #define BLOCK_SIZE_BIN_N( n, size )  (((size) - 1 - BIN_SIZE_MIN_##n) / BIN_SIZE_STEP_##n)
@@ -1129,21 +1129,27 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
      * so the first non-link block we find is always usable.
      * This is effectively O(1) per bucket rather than O(n) total. */
 
-    for (; index < FREE_LIST_COUNT; index++)
+    for (; index < min(FREE_LIST_COUNT, index + 4); index++)
     {
         list = &heap->free_lists[index];
-
-        LIST_FOR_EACH_ENTRY( entry, &list->entry, struct entry, entry )
+    
+        if (list_empty(&list->entry))
+            continue;
+    
+        LIST_FOR_EACH_ENTRY(entry, &list->entry, struct entry, entry)
         {
             block = &entry->block;
-
-            if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
-            if (block_get_size( block ) < block_size) continue;
-
-            if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size ))
+        
+            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+                continue;
+        
+            if (block_get_size(block) < block_size)
+                break; // stop scanning this bucket early
+        
+            if (!subheap_commit(heap, block_get_subheap(heap, block), block, block_size))
                 return NULL;
-
-            list_remove( &entry->entry );
+        
+            list_remove(&entry->entry);
             return block;
         }
     }
