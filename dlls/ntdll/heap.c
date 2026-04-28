@@ -28,7 +28,6 @@
 #define RUNNING_ON_VALGRIND 0  /* FIXME */
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
@@ -66,6 +65,13 @@ struct rtl_heap_entry
             LPVOID lpLastBlock;
         } Region;
     };
+};
+
+struct heap_scan_state
+{
+    struct list *ptr;
+    SIZE_T scanned;
+    SIZE_T block_size;
 };
 
 /* rtl_heap_entry flags, names made up */
@@ -263,9 +269,6 @@ struct bin
 
     /* list of groups with free blocks */
     SLIST_HEADER groups;
-    LONG group_alloc;
-    LONG group_freed;
-    LONG group_max;
 
     /* array of affinity reserved groups, interleaved with other bins to keep
      * all pointers of the same affinity and different bin grouped together,
@@ -281,7 +284,10 @@ static inline struct group **bin_get_affinity_group( struct bin *bin, BYTE affin
 }
 
 struct heap
-{                                  /* win32/win64 */
+{                        
+    struct heap_scan_state scan;
+
+        /* win32/win64 */
     DWORD_PTR        unknown1[2];   /* 0000/0000 */
     DWORD            ffeeffee;      /* 0008/0010 */
     DWORD            auto_flags;    /* 000c/0014 */
@@ -331,10 +337,6 @@ C_ASSERT( HEAP_MIN_LARGE_BLOCK_SIZE <= HEAP_INITIAL_GROW_SIZE );
 #define HEAP_VALIDATE_ALL     0x20000000
 #define HEAP_VALIDATE_PARAMS  0x40000000
 #define HEAP_CHECKING_ENABLED 0x80000000
-
-BOOL delay_heap_free = FALSE;
-BOOL heap_zero_hack = FALSE;
-BOOL heap_top_down_hack = FALSE;
 
 static struct heap *process_heap;  /* main process heap */
 
@@ -979,7 +981,6 @@ static struct block *split_block( struct heap *heap, ULONG flags, struct block *
 static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_size, SIZE_T *commit_size )
 {
     const SIZE_T align = 0x400 * sizeof(void*);  /* minimum alignment for virtual allocations */
-    ULONG reserve_flags = MEM_RESERVE;
     void *addr = NULL;
     NTSTATUS status;
 
@@ -992,10 +993,8 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
     *region_size = ROUND_SIZE( *region_size, align - 1 );
     *commit_size = ROUND_SIZE( *commit_size, align - 1 );
 
-    if (heap_top_down_hack) reserve_flags |= MEM_TOP_DOWN;
-
     /* allocate the memory block */
-    if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, reserve_flags,
+    if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, MEM_RESERVE,
                                            get_protection_type( flags ) )))
     {
         WARN( "Could not allocate %#Ix bytes, status %#lx\n", *region_size, status );
@@ -1119,28 +1118,43 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 
 static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
-    struct entry *entry;
+    unsigned int index = get_free_list_index( block_size );
+    struct entry *list, *entry;
     struct block *block;
     SIZE_T total_size;
     SUBHEAP *subheap;
 
-    /* Find a suitable free list, and in it find a block large enough */
+    /* Walk only from the correct bucket to the end sentinel —
+     * each bucket contains only blocks of the right size range,
+     * so the first non-link block we find is always usable.
+     * This is effectively O(1) per bucket rather than O(n) total. */
 
-    while ((ptr = list_next( &heap->free_lists[0].entry, ptr )))
+    for (; index < min(FREE_LIST_COUNT, index + 4); index++)
     {
-        entry = LIST_ENTRY( ptr, struct entry, entry );
-        block = &entry->block;
-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
-        if (block_get_size( block ) >= block_size)
+        list = &heap->free_lists[index];
+    
+        if (list_empty(&list->entry))
+            continue;
+    
+        LIST_FOR_EACH_ENTRY(entry, &list->entry, struct entry, entry)
         {
-            if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
-            list_remove( &entry->entry );
+            block = &entry->block;
+        
+            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
+                continue;
+        
+            if (block_get_size(block) < block_size)
+                break; // stop scanning this bucket early
+        
+            if (!subheap_commit(heap, block_get_subheap(heap, block), block, block_size))
+                return NULL;
+        
+            list_remove(&entry->entry);
             return block;
         }
     }
 
-    /* make sure we can fit the block and a free entry at the end */
+    /* No suitable block found — allocate a new subheap */
     total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
     if (total_size < block_size) return NULL;  /* overflow */
 
@@ -1148,7 +1162,7 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
     {
         heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
     }
-    else while (!subheap)  /* shrink the grow size again if we are running out of space */
+    else while (!subheap)
     {
         if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
         heap->grow_size /= 2;
@@ -1494,8 +1508,8 @@ static void heap_set_debug_flags( HANDLE handle )
         }
     }
 
-    if (delay_heap_free || ((heap->flags & HEAP_GROWABLE) && !heap->pending_free &&
-        ((flags & HEAP_FREE_CHECKING_ENABLED) || RUNNING_ON_VALGRIND)))
+    if ((heap->flags & HEAP_GROWABLE) && !heap->pending_free &&
+        ((flags & HEAP_FREE_CHECKING_ENABLED) || RUNNING_ON_VALGRIND))
     {
         heap->pending_free = RtlAllocateHeap( handle, HEAP_ZERO_MEMORY,
                                               MAX_FREE_PENDING * sizeof(*heap->pending_free) );
@@ -1518,9 +1532,6 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
 
     TRACE( "flags %#lx, addr %p, total_size %#Ix, commit_size %#Ix, lock %p, params %p\n",
            flags, addr, total_size, commit_size, lock, params );
-
-    if (heap_zero_hack)
-        flags |= HEAP_ZERO_MEMORY;
 
     flags &= ~(HEAP_TAIL_CHECKING_ENABLED|HEAP_FREE_CHECKING_ENABLED);
     if (process_heap) flags |= HEAP_PRIVATE;
@@ -1873,7 +1884,7 @@ static inline ULONG heap_current_thread_affinity(void)
 /* acquire a group from the bin, thread takes ownership of a shared group or allocates a new one */
 static struct group *heap_acquire_bin_group( struct heap *heap, ULONG flags, SIZE_T block_size, struct bin *bin )
 {
-    ULONG affinity = NtCurrentTeb()->HeapVirtualAffinity, count;
+    ULONG affinity = NtCurrentTeb()->HeapVirtualAffinity;
     struct group *group;
     SLIST_ENTRY *entry;
 
@@ -1883,8 +1894,6 @@ static struct group *heap_acquire_bin_group( struct heap *heap, ULONG flags, SIZ
     if ((entry = RtlInterlockedPopEntrySList( &bin->groups )))
         return CONTAINING_RECORD( entry, struct group, entry );
 
-    count = InterlockedIncrement( &bin->group_alloc ) - ReadNoFence( &bin->group_freed );
-    if (count > ReadAcquire( &bin->group_max )) WriteRelease( &bin->group_max, count );
     return group_allocate( heap, flags, block_size );
 }
 
@@ -1900,13 +1909,12 @@ static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct b
         return STATUS_SUCCESS;
 
     /* try re-using the block group instead of releasing it */
-    if (RtlQueryDepthSList( &bin->groups ) <= ReadAcquire( &bin->group_max ))
+    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
     {
         RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
         return STATUS_SUCCESS;
     }
 
-    InterlockedIncrement( &bin->group_freed );
     return group_release( heap, flags, bin, group );
 }
 
@@ -1995,13 +2003,13 @@ static void bin_try_enable( struct heap *heap, struct bin *bin )
 {
     ULONG alloc = ReadNoFence( &bin->count_alloc ), freed = ReadNoFence( &bin->count_freed );
     SIZE_T block_size = BLOCK_BIN_SIZE( bin - heap->bins );
-    BOOL enable = FALSE;
+    BOOL enable = TRUE;
 
-    if (bin == heap->bins && alloc > 0x10) enable = TRUE;
-    else if (bin - heap->bins < 0x30 && alloc > 0x800) enable = TRUE;
-    else if (bin - heap->bins < 0x30 && alloc - freed > 0x10) enable = TRUE;
-    else if (alloc - freed > 0x400000 / block_size) enable = TRUE;
-    if (!enable) return;
+    //if (bin == heap->bins && alloc > 0x10) enable = TRUE;
+    //else if (bin - heap->bins < 0x30 && alloc > 0x800) enable = TRUE;
+    //else if (bin - heap->bins < 0x30 && alloc - freed > 0x10) enable = TRUE;
+    //else if (alloc - freed > 0x400000 / block_size) enable = TRUE;
+    //if (!enable) return;
 
     if (ReadNoFence( &heap->compat_info ) != HEAP_LFH)
     {
@@ -2631,7 +2639,7 @@ NTSTATUS WINAPI RtlSetHeapInformation( HANDLE handle, HEAP_INFORMATION_CLASS inf
             FIXME( "HeapCompatibilityInformation %lu not implemented!\n", compat_info );
             return STATUS_UNSUCCESSFUL;
         }
-        if (!delay_heap_free && InterlockedCompareExchange( &heap->compat_info, compat_info, HEAP_STD ) != HEAP_STD)
+        if (InterlockedCompareExchange( &heap->compat_info, compat_info, HEAP_STD ) != HEAP_STD)
             return STATUS_UNSUCCESSFUL;
         return STATUS_SUCCESS;
     }
