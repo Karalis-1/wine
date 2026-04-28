@@ -43,18 +43,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(heap);
 #define HEAP_LAL 1
 #define HEAP_LFH 2
 
-static NTSTATUS heap_release_bin_group(
-    struct heap *heap,
-    ULONG flags,
-    struct bin *bin,
-    struct group *group);
-
-static struct block *find_free_bin_block(
-    struct heap *heap,
-    ULONG flags,
-    SIZE_T block_size,
-    struct bin *bin);
-    
 /* undocumented RtlWalkHeap structure */
 
 struct rtl_heap_entry
@@ -1760,6 +1748,27 @@ static NTSTATUS heap_allocate_block_lfh( struct heap *heap, ULONG flags, SIZE_T 
     return block ? STATUS_SUCCESS : STATUS_NO_MEMORY;
 }
 
+/* release a thread owned and fully freed group to the bin shared group, or free its memory */
+static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct bin *bin, struct group *group )
+{
+    ULONG affinity = group->affinity;
+
+    /* using InterlockedExchangePointer here would possibly return a group that has used blocks,
+     * we prefer keeping our fully freed group instead for reduced memory consumption.
+     */
+    if (!InterlockedCompareExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), group, NULL ))
+        return STATUS_SUCCESS;
+
+    /* try re-using the block group instead of releasing it */
+    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
+    {
+        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
+        return STATUS_SUCCESS;
+    }
+
+    return group_release( heap, flags, bin, group );
+}
+
 static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block )
 {
     struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
@@ -1957,27 +1966,6 @@ static struct group *heap_acquire_bin_group( struct heap *heap, ULONG flags, SIZ
         return CONTAINING_RECORD( entry, struct group, entry );
 
     return group_allocate( heap, flags, block_size );
-}
-
-/* release a thread owned and fully freed group to the bin shared group, or free its memory */
-static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct bin *bin, struct group *group )
-{
-    ULONG affinity = group->affinity;
-
-    /* using InterlockedExchangePointer here would possibly return a group that has used blocks,
-     * we prefer keeping our fully freed group instead for reduced memory consumption.
-     */
-    if (!InterlockedCompareExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), group, NULL ))
-        return STATUS_SUCCESS;
-
-    /* try re-using the block group instead of releasing it */
-    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
-    {
-        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
-        return STATUS_SUCCESS;
-    }
-
-    return group_release( heap, flags, bin, group );
 }
 
 static struct block *find_free_bin_block( struct heap *heap, ULONG flags, SIZE_T block_size, struct bin *bin )
