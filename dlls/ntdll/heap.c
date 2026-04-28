@@ -2156,6 +2156,7 @@ static NTSTATUS heap_resize_large( struct heap *heap, ULONG flags, struct block 
 static NTSTATUS heap_resize_block( struct heap *heap, ULONG flags, struct block *block, SIZE_T block_size,
                                    SIZE_T size, SIZE_T old_block_size, SIZE_T *old_size, void **ret )
 {
+    return heap_resize_block_lfh( block, flags, block_size, size, old_size, ret );
     SUBHEAP *subheap = block_get_subheap( heap, block );
     struct block *next;
 
