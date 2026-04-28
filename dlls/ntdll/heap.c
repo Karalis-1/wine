@@ -1997,13 +1997,13 @@ static void bin_try_enable( struct heap *heap, struct bin *bin )
 {
     ULONG alloc = ReadNoFence( &bin->count_alloc ), freed = ReadNoFence( &bin->count_freed );
     SIZE_T block_size = BLOCK_BIN_SIZE( bin - heap->bins );
-    BOOL enable = FALSE;
+    BOOL enable = TRUE;
 
-    if (bin == heap->bins && alloc > 0x10) enable = TRUE;
-    else if (bin - heap->bins < 0x30 && alloc > 0x800) enable = TRUE;
-    else if (bin - heap->bins < 0x30 && alloc - freed > 0x10) enable = TRUE;
-    else if (alloc - freed > 0x400000 / block_size) enable = TRUE;
-    if (!enable) return;
+    //if (bin == heap->bins && alloc > 0x10) enable = TRUE;
+    //else if (bin - heap->bins < 0x30 && alloc > 0x800) enable = TRUE;
+    //else if (bin - heap->bins < 0x30 && alloc - freed > 0x10) enable = TRUE;
+    //else if (alloc - freed > 0x400000 / block_size) enable = TRUE;
+    //if (!enable) return;
 
     if (ReadNoFence( &heap->compat_info ) != HEAP_LFH)
     {
