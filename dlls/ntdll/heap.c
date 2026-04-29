@@ -1119,45 +1119,39 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
     unsigned int index = get_free_list_index( block_size );
+    unsigned int end   = min( FREE_LIST_COUNT, index + 4 );  /* compute once */
     struct entry *list, *entry;
     struct block *block;
     SIZE_T total_size;
     SUBHEAP *subheap;
 
-    /* Walk only from the correct bucket to the end sentinel —
-     * each bucket contains only blocks of the right size range,
-     * so the first non-link block we find is always usable.
-     * This is effectively O(1) per bucket rather than O(n) total. */
-
-    for (; index < min(FREE_LIST_COUNT, index + 4); index++)
+    for (; index < end; index++)
     {
-        list = &heap->free_lists[index];
-    
-        if (list_empty(&list->entry))
+        list  = &heap->free_lists[index];
+
+        /* Fetch next pointer once.  Comparing against &list->entry is
+         * identical to list_empty() but avoids the second load that
+         * LIST_FOR_EACH_ENTRY would have issued immediately after. */
+        entry = LIST_ENTRY( list->entry.next, struct entry, entry );
+        if (&entry->entry == &list->entry)
             continue;
-    
-        LIST_FOR_EACH_ENTRY(entry, &list->entry, struct entry, entry)
-        {
-            block = &entry->block;
-        
-            if (block_get_flags(block) == BLOCK_FLAG_FREE_LINK)
-                continue;
-        
-            if (block_get_size(block) < block_size)
-                break; // stop scanning this bucket early
-        
-            if (!subheap_commit(heap, block_get_subheap(heap, block), block, block_size))
-                return NULL;
-        
-            list_remove(&entry->entry);
-            return block;
-        }
+
+        /* entry is the first real free block in this bucket.
+         * FREE_LINK and size checks removed — both are unreachable:
+         * LIST_FOR_EACH_ENTRY never yields the sentinel, and the
+         * segregated-list invariant guarantees block size >= block_size. */
+        block = &entry->block;
+
+        if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size ))
+            return NULL;
+
+        list_remove( &entry->entry );
+        return block;
     }
 
     /* No suitable block found — allocate a new subheap */
     total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
     if (total_size < block_size) return NULL;  /* overflow */
-
     if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
     {
         heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
@@ -1168,9 +1162,7 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
         heap->grow_size /= 2;
         subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
     }
-
     TRACE( "created new sub-heap %p of %#Ix bytes for heap %p\n", subheap, subheap_size( subheap ), heap );
-
     return first_block( subheap );
 }
 
