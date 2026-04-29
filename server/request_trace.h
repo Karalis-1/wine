@@ -148,7 +148,6 @@ static void dump_init_first_thread_reply( const struct init_first_thread_reply *
     fprintf( stderr, ", tid=%04x", req->tid );
     dump_timeout( ", server_start=", &req->server_start );
     fprintf( stderr, ", session_id=%08x", req->session_id );
-    fprintf( stderr, ", inproc_device=%04x", req->inproc_device );
     fprintf( stderr, ", info_size=%u", req->info_size );
     dump_varargs_ushorts( ", machines=", cur_size );
 }
@@ -1394,7 +1393,7 @@ static void dump_set_queue_mask_request( const struct set_queue_mask_request *re
 {
     fprintf( stderr, " wake_mask=%08x", req->wake_mask );
     fprintf( stderr, ", changed_mask=%08x", req->changed_mask );
-    fprintf( stderr, ", poll_events=%d", req->poll_events );
+    fprintf( stderr, ", skip_wait=%d", req->skip_wait );
 }
 
 static void dump_set_queue_mask_reply( const struct set_queue_mask_reply *req )
@@ -2395,9 +2394,9 @@ static void dump_create_class_request( const struct create_class_request *req )
     fprintf( stderr, ", atom=%04x", req->atom );
     fprintf( stderr, ", style=%08x", req->style );
     dump_uint64( ", instance=", &req->instance );
-    dump_uint64( ", client_ptr=", &req->client_ptr );
-    fprintf( stderr, ", cls_extra=%d", req->cls_extra );
+    fprintf( stderr, ", extra=%d", req->extra );
     fprintf( stderr, ", win_extra=%d", req->win_extra );
+    dump_uint64( ", client_ptr=", &req->client_ptr );
     fprintf( stderr, ", name_offset=%u", req->name_offset );
     dump_varargs_unicode_str( ", name=", cur_size );
 }
@@ -3390,26 +3389,6 @@ static void dump_set_keyboard_repeat_reply( const struct set_keyboard_repeat_rep
     fprintf( stderr, " enable=%d", req->enable );
 }
 
-static void dump_get_inproc_sync_fd_request( const struct get_inproc_sync_fd_request *req )
-{
-    fprintf( stderr, " handle=%04x", req->handle );
-}
-
-static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply *req )
-{
-    fprintf( stderr, " type=%d", req->type );
-    fprintf( stderr, ", access=%08x", req->access );
-}
-
-static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
-{
-}
-
-static void dump_get_inproc_alert_fd_reply( const struct get_inproc_alert_fd_reply *req )
-{
-    fprintf( stderr, " handle=%04x", req->handle );
-}
-
 static void dump_d3dkmt_object_create_request( const struct d3dkmt_object_create_request *req )
 {
     fprintf( stderr, " type=%08x", req->type );
@@ -3812,8 +3791,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_next_process_request,
     (dump_func)dump_get_next_thread_request,
     (dump_func)dump_set_keyboard_repeat_request,
-    (dump_func)dump_get_inproc_sync_fd_request,
-    (dump_func)dump_get_inproc_alert_fd_request,
     (dump_func)dump_d3dkmt_object_create_request,
     (dump_func)dump_d3dkmt_object_update_request,
     (dump_func)dump_d3dkmt_object_query_request,
@@ -4122,8 +4099,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_next_process_reply,
     (dump_func)dump_get_next_thread_reply,
     (dump_func)dump_set_keyboard_repeat_reply,
-    (dump_func)dump_get_inproc_sync_fd_reply,
-    (dump_func)dump_get_inproc_alert_fd_reply,
     (dump_func)dump_d3dkmt_object_create_reply,
     NULL,
     (dump_func)dump_d3dkmt_object_query_reply,
@@ -4432,8 +4407,6 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_next_process",
     "get_next_thread",
     "set_keyboard_repeat",
-    "get_inproc_sync_fd",
-    "get_inproc_alert_fd",
     "d3dkmt_object_create",
     "d3dkmt_object_update",
     "d3dkmt_object_query",

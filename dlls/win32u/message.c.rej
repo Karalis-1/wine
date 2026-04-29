@@ -1,0 +1,206 @@
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -3179,21 +3178,6 @@ static HANDLE get_server_queue_handle(void)
+     return ret;
+ }
+ 
+-static BOOL is_queue_signaled(void)
+-{
+-    struct object_lock lock = OBJECT_LOCK_INIT;
+-    const queue_shm_t *queue_shm;
+-    BOOL signaled = FALSE;
+-    UINT status;
+-
+-    while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+-        signaled = (queue_shm->wake_bits & queue_shm->wake_mask) ||
+-                   (queue_shm->changed_bits & queue_shm->changed_mask);
+-    if (status) return FALSE;
+-
+-    return signaled;
+-}
+-
+ static BOOL check_internal_bits( UINT mask )
+ {
+     struct object_lock lock = OBJECT_LOCK_INIT;
+@@ -3220,21 +3204,16 @@ BOOL process_driver_events( UINT mask )
+         SERVER_END_REQ;
+     }
+ 
+-    /* process every pending internal hardware messages */
+-    if (check_internal_bits( QS_HARDWARE ))
+-    {
+-        struct peek_message_filter filter = {.internal = TRUE};
+-        MSG msg;
+-        peek_message( &msg, &filter );
+-    }
+-
+-    /* check for hardware messages requiring client dispatch */
+     return check_internal_bits( QS_HARDWARE );
+ }
+ 
+ void check_for_events( UINT flags )
+ {
++    struct peek_message_filter filter = {.internal = TRUE, .flags = PM_REMOVE};
++    MSG msg;
++
+     if (!process_driver_events( flags )) flush_window_surfaces( TRUE );
++    peek_message( &msg, &filter );
+ }
+ 
+ /* monotonic timer tick for throttling driver event checks */
+@@ -3268,16 +3247,10 @@ static inline LARGE_INTEGER *get_nt_timeout( LARGE_INTEGER *time, DWORD timeout
+ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DWORD mask, DWORD flags )
+ {
+     struct thunk_lock_params params = {.dispatch.callback = thunk_lock_callback};
+-    LARGE_INTEGER time, now, *abs;
++    LARGE_INTEGER time;
++    DWORD ret;
+     void *ret_ptr;
+     ULONG ret_len;
+-    DWORD ret;
+-
+-    if ((abs = get_nt_timeout( &time, timeout )))
+-    {
+-        NtQuerySystemTime( &now );
+-        abs->QuadPart = now.QuadPart - abs->QuadPart;
+-    }
+ 
+     if (!KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len ) &&
+         ret_len == sizeof(params.locks))
+@@ -3289,13 +3262,14 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     if (process_driver_events( QS_ALLINPUT )) ret = count - 1;
+     else
+     {
+-        do ret = NtWaitForMultipleObjects( count, handles, !(flags & MWMO_WAITALL), !!(flags & MWMO_ALERTABLE), abs );
+-        while (ret == count - 1 && !process_driver_events( QS_ALLINPUT ) && !is_queue_signaled());
+-    }
+-    if (HIWORD(ret)) /* is it an error code? */
+-    {
+-        RtlSetLastWin32Error( RtlNtStatusToDosError(ret) );
+-        ret = WAIT_FAILED;
++        ret = NtWaitForMultipleObjects( count, handles, !(flags & MWMO_WAITALL),
++                                        !!(flags & MWMO_ALERTABLE), get_nt_timeout( &time, timeout ));
++        if (ret == count - 1) process_driver_events( QS_ALLINPUT );
++        else if (HIWORD(ret)) /* is it an error code? */
++        {
++            RtlSetLastWin32Error( RtlNtStatusToDosError(ret) );
++            ret = WAIT_FAILED;
++        }
+     }
+ 
+     if (ret == WAIT_TIMEOUT && !count && !timeout) NtYieldExecution();
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -3195,7 +3195,7 @@ static BOOL check_internal_bits( UINT mask )
+ 
+ BOOL process_driver_events( UINT mask )
+ {
+-    if (check_internal_bits( QS_DRIVER ) && user_driver->pProcessEvents( mask ))
++    if (user_driver->pProcessEvents( mask ))
+     {
+         SERVER_START_REQ( set_queue_mask )
+         {
+@@ -3205,7 +3205,7 @@ BOOL process_driver_events( UINT mask )
+         SERVER_END_REQ;
+     }
+ 
+-    return check_internal_bits( QS_HARDWARE );
++    return has_hardware_messages();
+ }
+ 
+ void check_for_events( UINT flags )
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -3175,33 +3171,9 @@ static HANDLE get_server_queue_handle(void)
+     return ret;
+ }
+ 
+-static BOOL has_hardware_messages(void)
+-{
+-    struct object_lock lock = OBJECT_LOCK_INIT;
+-    const queue_shm_t *queue_shm;
+-    BOOL signaled = FALSE;
+-    UINT status;
+-
+-    while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
+-        signaled = queue_shm->internal_bits & QS_HARDWARE;
+-    if (status) return FALSE;
+-
+-    return signaled;
+-}
+-
+ BOOL process_driver_events( UINT mask )
+ {
+-    if (user_driver->pProcessEvents( mask ))
+-    {
+-        SERVER_START_REQ( set_queue_mask )
+-        {
+-            req->poll_events = 1;
+-            wine_server_call( req );
+-        }
+-        SERVER_END_REQ;
+-    }
+-
+-    return has_hardware_messages();
++    return user_driver->pProcessEvents( mask );
+ }
+ 
+ void check_for_events( UINT flags )
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -3154,20 +3144,6 @@ static HANDLE get_server_queue_handle(void)
+     return ret;
+ }
+ 
+-BOOL process_driver_events( UINT mask )
+-{
+-    return user_driver->pProcessEvents( mask );
+-}
+-
+-void check_for_events( UINT flags )
+-{
+-    struct peek_message_filter filter = {.internal = TRUE, .flags = PM_REMOVE};
+-    MSG msg;
+-
+-    if (!process_driver_events( flags )) flush_window_surfaces( TRUE );
+-    peek_message( &msg, &filter );
+-}
+-
+ /* monotonic timer tick for throttling driver event checks */
+ static inline LONGLONG get_driver_check_time(void)
+ {
+@@ -3182,7 +3158,7 @@ static inline void check_for_driver_events(void)
+     if (get_user_thread_info()->last_driver_time != get_driver_check_time())
+     {
+         flush_window_surfaces( FALSE );
+-        process_driver_events( QS_ALLINPUT );
++        user_driver->pProcessEvents( QS_ALLINPUT );
+         get_user_thread_info()->last_driver_time = get_driver_check_time();
+     }
+ }
+@@ -3211,12 +3187,12 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+         params.restore = TRUE;
+     }
+ 
+-    if (process_driver_events( QS_ALLINPUT )) ret = count - 1;
++    if (user_driver->pProcessEvents( mask )) ret = count - 1;
+     else
+     {
+         ret = NtWaitForMultipleObjects( count, handles, !(flags & MWMO_WAITALL),
+                                         !!(flags & MWMO_ALERTABLE), get_nt_timeout( &time, timeout ));
+-        if (ret == count - 1) process_driver_events( QS_ALLINPUT );
++        if (ret == count - 1) user_driver->pProcessEvents( mask );
+         else if (HIWORD(ret)) /* is it an error code? */
+         {
+             RtlSetLastWin32Error( RtlNtStatusToDosError(ret) );
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -27,8 +27,6 @@
+ #include <assert.h>
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+-#include "winternl.h"
+-#include "ddk/wdm.h"
+ #include "win32u_private.h"
+ #include "ntuser_private.h"
+ #include "winnls.h"

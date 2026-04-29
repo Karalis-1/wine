@@ -1,0 +1,29 @@
+--- dlls/win32u/class.c
++++ dlls/win32u/class.c
+@@ -515,17 +487,21 @@ ATOM WINAPI NtUserRegisterClassExWOW( const WNDCLASSEXW *wc, UNICODE_STRING *nam
+     if (wc->cbWndExtra > 40)  /* Extra bytes are limited to 40 in Win32 */
+         WARN("Win extra bytes %d is > 40\n", wc->cbWndExtra );
+ 
+-    if (!(class = calloc( 1, sizeof(*class) ))) return 0;
++    if (!(class = calloc( 1, sizeof(CLASS) + wc->cbClsExtra ))) return 0;
+ 
++    class->style      = wc->style;
+     class->local      = !is_builtin && !(wc->style & CS_GLOBALCLASS);
++    class->cbWndExtra = wc->cbWndExtra;
++    class->cbClsExtra = wc->cbClsExtra;
++    class->instance   = (UINT_PTR)instance;
+ 
+     SERVER_START_REQ( create_class )
+     {
+         req->local      = class->local;
+-        req->style      = wc->style;
+-        req->instance   = wine_server_client_ptr( instance );
+-        req->cls_extra  = wc->cbClsExtra;
+-        req->win_extra  = wc->cbWndExtra;
++        req->style      = class->style;
++        req->instance   = class->instance;
++        req->extra      = class->cbClsExtra;
++        req->win_extra  = class->cbWndExtra;
+         req->client_ptr = wine_server_client_ptr( class );
+         req->atom       = wine_server_add_atom( req, name );
+         req->name_offset = version->Length / sizeof(WCHAR);

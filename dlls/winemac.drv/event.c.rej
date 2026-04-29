@@ -1,0 +1,17 @@
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -563,13 +571,5 @@ BOOL macdrv_ProcessEvents(DWORD mask)
+         data->current_event->type != WINDOW_DRAG_BEGIN)
+         event_mask = 0;  /* don't process nested events */
+ 
+-    while (macdrv_copy_event_from_queue(data->queue, event_mask, &event))
+-    {
+-        count++;
+-        macdrv_handle_event(event);
+-        macdrv_release_event(event);
+-    }
+-
+-    if (count) TRACE("processed %d events\n", count);
+-    return !check_fd_events(macdrv_get_event_queue_fd(data->queue), POLLIN);
++    return process_events(data->queue, event_mask);
+ }

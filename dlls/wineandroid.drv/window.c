@@ -390,19 +390,13 @@ static void pull_events(void)
 }
 
 
-static int check_fd_events( int fd, int events )
-{
-    struct pollfd pfd = {.fd = fd, .events = events};
-    if (poll( &pfd, 1, 0 ) <= 0) return 0;
-    return pfd.revents;
-}
-
 /***********************************************************************
  *           process_events
  */
 static int process_events( DWORD mask )
 {
     struct java_event *event, *next, *previous;
+    unsigned int count = 0;
 
     assert( GetCurrentThreadId() == desktop_tid );
 

@@ -1,0 +1,19 @@
+--- include/wine/server_protocol.h
++++ include/wine/server_protocol.h
+@@ -6859,15 +6835,14 @@ union generic_reply
+     struct get_next_process_reply get_next_process_reply;
+     struct get_next_thread_reply get_next_thread_reply;
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
+-    struct get_inproc_sync_fd_reply get_inproc_sync_fd_reply;
+     struct d3dkmt_object_create_reply d3dkmt_object_create_reply;
+     struct d3dkmt_object_update_reply d3dkmt_object_update_reply;
+     struct d3dkmt_object_query_reply d3dkmt_object_query_reply;
+     struct d3dkmt_object_open_reply d3dkmt_object_open_reply;
+     struct d3dkmt_share_objects_reply d3dkmt_share_objects_reply;
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 924
++#define SERVER_PROTOCOL_VERSION 921
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

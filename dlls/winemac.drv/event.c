@@ -26,8 +26,6 @@
 
 #include "config.h"
 
-#include <poll.h>
-
 #include "ntstatus.h"
 #include "macdrv.h"
 #include "oleidl.h"
@@ -486,12 +484,24 @@ void macdrv_handle_event(const macdrv_event *event)
 }
 
 
-static int check_fd_events( int fd, int events )
+/***********************************************************************
+ *              process_events
+ */
+static int process_events(macdrv_event_queue queue, macdrv_event_mask mask)
 {
-    struct pollfd pfd = {.fd = fd, .events = events};
-    if (poll( &pfd, 1, 0 ) <= 0) return 0;
-    return pfd.revents;
+    macdrv_event *event;
+    int count = 0;
+
+    while (macdrv_copy_event_from_queue(queue, mask, &event))
+    {
+        count++;
+        macdrv_handle_event(event);
+        macdrv_release_event(event);
+    }
+    if (count) TRACE("processed %d events\n", count);
+    return count;
 }
+
 
 /***********************************************************************
  *              ProcessEvents   (MACDRV.@)
@@ -500,8 +510,6 @@ BOOL macdrv_ProcessEvents(DWORD mask)
 {
     struct macdrv_thread_data *data = macdrv_thread_data();
     macdrv_event_mask event_mask = get_event_mask(mask);
-    macdrv_event *event;
-    int count = 0;
 
     TRACE("mask %x\n", mask);
 

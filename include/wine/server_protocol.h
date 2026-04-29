@@ -974,8 +974,6 @@ struct obj_locator
 };
 
 #define MAX_ATOM_LEN     255
-#define WH_WINEVENT      (WH_MAXHOOK + 1)
-#define NB_HOOKS         (WH_WINEVENT - WH_MINHOOK + 1)
 
 struct shared_cursor
 {
@@ -996,13 +994,11 @@ typedef volatile struct
 
 typedef volatile struct
 {
-    timeout_t            access_time;
+    int                  hooks_count[WH_MAX - WH_MIN + 2];
     unsigned int         wake_mask;
     unsigned int         wake_bits;
     unsigned int         changed_mask;
     unsigned int         changed_bits;
-    unsigned int         internal_bits;
-    int                  hooks_count[NB_HOOKS];
 } queue_shm_t;
 
 typedef volatile struct
@@ -1024,16 +1020,9 @@ typedef volatile struct
 
 typedef volatile struct
 {
-    atom_t               atom;
-    unsigned int         style;
-    unsigned int         cls_extra;
-    unsigned int         win_extra;
-    mod_handle_t         instance;
     data_size_t          name_offset;
     data_size_t          name_len;
     WCHAR                name[MAX_ATOM_LEN];
-    unsigned short       __pad;
-    char                 extra[];
 } class_shm_t;
 
 typedef volatile struct
@@ -1181,10 +1170,8 @@ struct init_first_thread_reply
     thread_id_t  tid;
     timeout_t    server_start;
     unsigned int session_id;
-    obj_handle_t inproc_device;
     data_size_t  info_size;
     /* VARARG(machines,ushorts); */
-    char __pad_36[4];
 };
 
 
@@ -3024,7 +3011,7 @@ struct set_queue_mask_request
     struct request_header __header;
     unsigned int wake_mask;
     unsigned int changed_mask;
-    int          poll_events;
+    int          skip_wait;
 };
 struct set_queue_mask_reply
 {
@@ -3127,7 +3114,6 @@ struct send_hardware_message_reply
     int             new_y;
     char __pad_28[4];
 };
-#define SEND_HWMSG_INJECTED    0x01
 
 
 
@@ -4504,11 +4490,12 @@ struct create_class_request
     atom_t         atom;
     unsigned int   style;
     mod_handle_t   instance;
+    int            extra;
+    int            win_extra;
     client_ptr_t   client_ptr;
-    short int      cls_extra;
-    short int      win_extra;
     data_size_t    name_offset;
     /* VARARG(name,unicode_str); */
+    char __pad_52[4];
 };
 struct create_class_reply
 {
@@ -5982,43 +5969,6 @@ struct set_keyboard_repeat_reply
 };
 
 
-enum inproc_sync_type
-{
-    INPROC_SYNC_UNKNOWN   = 0,
-    INPROC_SYNC_INTERNAL  = 1,
-    INPROC_SYNC_EVENT     = 2,
-    INPROC_SYNC_MUTEX     = 3,
-    INPROC_SYNC_SEMAPHORE = 4,
-};
-
-
-struct get_inproc_sync_fd_request
-{
-    struct request_header __header;
-    obj_handle_t handle;
-};
-struct get_inproc_sync_fd_reply
-{
-    struct reply_header __header;
-    int           type;
-    unsigned int access;
-};
-
-
-
-struct get_inproc_alert_fd_request
-{
-    struct request_header __header;
-    char __pad_12[4];
-};
-struct get_inproc_alert_fd_reply
-{
-    struct reply_header __header;
-    obj_handle_t handle;
-    char __pad_12[4];
-};
-
-
 
 struct d3dkmt_object_create_request
 {
@@ -6460,8 +6410,6 @@ enum request
     REQ_get_next_process,
     REQ_get_next_thread,
     REQ_set_keyboard_repeat,
-    REQ_get_inproc_sync_fd,
-    REQ_get_inproc_alert_fd,
     REQ_d3dkmt_object_create,
     REQ_d3dkmt_object_update,
     REQ_d3dkmt_object_query,
@@ -6773,8 +6721,6 @@ union generic_request
     struct get_next_process_request get_next_process_request;
     struct get_next_thread_request get_next_thread_request;
     struct set_keyboard_repeat_request set_keyboard_repeat_request;
-    struct get_inproc_sync_fd_request get_inproc_sync_fd_request;
-    struct get_inproc_alert_fd_request get_inproc_alert_fd_request;
     struct d3dkmt_object_create_request d3dkmt_object_create_request;
     struct d3dkmt_object_update_request d3dkmt_object_update_request;
     struct d3dkmt_object_query_request d3dkmt_object_query_request;
@@ -7085,7 +7031,6 @@ union generic_reply
     struct get_next_thread_reply get_next_thread_reply;
     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
     struct get_inproc_sync_fd_reply get_inproc_sync_fd_reply;
-    struct get_inproc_alert_fd_reply get_inproc_alert_fd_reply;
     struct d3dkmt_object_create_reply d3dkmt_object_create_reply;
     struct d3dkmt_object_update_reply d3dkmt_object_update_reply;
     struct d3dkmt_object_query_reply d3dkmt_object_query_reply;
@@ -7096,6 +7041,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 931
+#define SERVER_PROTOCOL_VERSION 932
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

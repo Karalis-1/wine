@@ -1,0 +1,12 @@
+--- dlls/ntdll/unix/file.c
++++ dlls/ntdll/unix/file.c
+@@ -7082,6 +7316,9 @@ NTSTATUS WINAPI NtCancelIoFileEx( HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_
+ 
+     TRACE( "%p %p %p\n", handle, io, io_status );
+ 
++    if (ac_odyssey && !cancel_async_file_read( handle, io ))
++        return (io_status->Status = STATUS_SUCCESS);
++
+     SERVER_START_REQ( cancel_async )
+     {
+         req->handle = wine_server_obj_handle( handle );

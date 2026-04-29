@@ -1,0 +1,12 @@
+--- server/queue.c
++++ server/queue.c
+@@ -3288,6 +3288,9 @@ DECL_HANDLER(get_message)
+ 
+     set_error( STATUS_PENDING );  /* FIXME */
+ 
++    if (do_fsync() && !is_signaled( queue ))
++        fsync_clear( &queue->obj );
++
+     if (do_esync() && !is_signaled( queue ))
+         esync_clear( queue->esync_fd );
+ 
