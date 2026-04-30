@@ -1144,7 +1144,7 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
                 continue;
         
             if (block_get_size(block) < block_size)
-                continue;
+                break;
         
             if (!subheap_commit(heap, block_get_subheap(heap, block), block, block_size))
                 return NULL;
